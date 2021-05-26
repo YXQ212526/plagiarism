@@ -21,20 +21,7 @@ Options:
 
 
 run_build() {
-  if [[ $version = dm ]]; then
-    build_dir=$build_directory/dm/v1/$language
-  elif [[ $version = coin ]]; then
-    build_dir=$build_directory/coin_margined_swap/v1/$language
-  elif [[ $version = usdt ]]; then
-    build_dir=$build_directory/usdt_swap/v1/$language
-  elif [[ $version = option ]]; then
-    build_dir=$build_directory/option/v1/$language
-  else
-    version="v"${version}
-    build_dir=$build_directory/spot/$version/$language
-  fi
-  echo "build_dir="$build_dir
-  bundle exec middleman build --clean --build-dir $build_dir
+  bundle exec middleman build --clean
 }
 
 parse_args() {
@@ -42,15 +29,14 @@ parse_args() {
   if [ -e ".env" ]; then
     source .env
   fi
-  #
-  check_version_lang
+
   # Parse arg flags
   # If something is exposed as an environment variable, set/overwrite it
   # here. Otherwise, set/overwrite the internal variable instead.
   while : ; do
     if [[ $1 = "-h" || $1 = "--help" ]]; then
       echo "$help_message"
-      return 0
+      exit 0
     elif [[ $1 = "-v" || $1 = "--verbose" ]]; then
       verbose=true
       shift
@@ -74,11 +60,16 @@ parse_args() {
     fi
   done
 
+  if [ ${source_only} ] && [ ${push_only} ]; then
+    >&2 echo "You can only specify one of --source-only or --push-only"
+    exit 1
+  fi
+
   # Set internal option vars from the environment and arg flags. All internal
   # vars should be declared here, with sane defaults if applicable.
+
   # Source directory & target branch.
-  build_directory=build
-  gh_pages_directory=gh-pages
+  deploy_directory=build
   deploy_branch=gh-pages
 
   #if no user identity is already set in the current git environment, use this:
@@ -90,25 +81,6 @@ parse_args() {
 
   #append commit hash to the end of message by default
   append_hash=${GIT_DEPLOY_APPEND_HASH:-true}
-}
-
-check_version_lang() {
-  #
-  branch=$(git describe --contains --all HEAD)
-  echo "branch="$branch""
-  #
-  language=$(echo $branch | rev | cut -d '_' -f 1 | rev)
-  version=$(echo $branch | cut -d '_' -f 1)
-
-  if [[ $version =~ ^v[0-9]$ ]] ; then
-    version=${version:1}
-  else
-    version=${version}
-  fi
-  #
-  echo "language="$language""
-  echo "version="$version""
-
 }
 
 main() {
@@ -134,108 +106,67 @@ main() {
 
   previous_branch=`git rev-parse --abbrev-ref HEAD`
 
-  if [ ! -d "$build_directory" ]; then
-    echo "Build directory '$build_directory' does not exist. Aborting." >&2
+  if [ ! -d "$deploy_directory" ]; then
+    echo "Deploy directory '$deploy_directory' does not exist. Aborting." >&2
     return 1
   fi
 
   # must use short form of flag in ls for compatibility with macOS and BSD
-  if [[ -z `ls -A "$build_directory" 2> /dev/null` && -z $allow_empty ]]; then
-    echo "Build directory '$build_directory' is empty. Aborting. If you're sure you want to deploy an empty tree, use the --allow-empty / -e flag." >&2
+  if [[ -z `ls -A "$deploy_directory" 2> /dev/null` && -z $allow_empty ]]; then
+    echo "Deploy directory '$deploy_directory' is empty. Aborting. If you're sure you want to deploy an empty tree, use the --allow-empty / -e flag." >&2
     return 1
   fi
 
-  if [ ! -d $gh_pages_directory ]; then
-      echo "./gh-pages doesn't exist. Creating now"
-      mkdir ./$gh_pages_directory
-      echo "./gh-pages created"
-  else
-      echo "./gh-pages exists"
+  if git ls-remote --exit-code $repo "refs/heads/$deploy_branch" ; then
+    # deploy_branch exists in $repo; make sure we have the latest version
+
+    disable_expanded_output
+    git fetch --force $repo $deploy_branch:$deploy_branch
+    enable_expanded_output
   fi
 
-  # if git ls-remote --exit-code $repo "refs/heads/$deploy_branch" ; then
-  #   # deploy_branch exists in $repo; make sure we have the latest version
-
-  #   disable_expanded_output
-  #   git fetch --force $repo $deploy_branch:$deploy_branch
-  #   enable_expanded_output
-  # fi
-
   # check if deploy_branch exists locally
-  if git show-ref --verify --quiet "refs/heads/$deploy_branch"; then
-    if git ls-remote --exit-code $repo "refs/heads/$deploy_branch" ; then
-      # deploy_branch exists in $repo; make sure we have the latest version
-
-      disable_expanded_output
-      git fetch --force $repo $deploy_branch:$deploy_branch
-      enable_expanded_output
-    fi
-    incremental_deploy
+  if git show-ref --verify --quiet "refs/heads/$deploy_branch"
+  then incremental_deploy
   else initial_deploy
   fi
 
   restore_head
 }
 
-handle_deploy_files() {
-  if [ -d "$gh_pages_directory/$version/$language" ]; then
-    rm -rf $gh_pages_directory/$version/$language
-  fi
-  cp -r $build_directory/* $gh_pages_directory
+initial_deploy() {
+  git --work-tree "$deploy_directory" checkout --orphan $deploy_branch
+  git --work-tree "$deploy_directory" add --all
+  commit+push
 }
 
-check_diff() {
+incremental_deploy() {
+  #make deploy_branch the current branch
+  git symbolic-ref HEAD refs/heads/$deploy_branch
+  #put the previously committed contents of deploy_branch into the index
+  git --work-tree "$deploy_directory" reset --mixed --quiet
+  git --work-tree "$deploy_directory" add --all
+
   set +o errexit
-  diff=$(git --work-tree "$gh_pages_directory" diff --exit-code --quiet HEAD --)$?
+  diff=$(git --work-tree "$deploy_directory" diff --exit-code --quiet HEAD --)$?
   set -o errexit
   case $diff in
-    0) echo No changes to files in $build_directory. Skipping commit.;;
+    0) echo No changes to files in $deploy_directory. Skipping commit.;;
     1) commit+push;;
     *)
-      echo git diff exited with code $diff. Aborting. Staying on branch $deploy_branch so you can debug. To switch back to master, use: git symbolic-ref HEAD refs/heads/master && git reset --mixed >&2
+      echo git diff exited with code $diff. Aborting. Staying on branch $deploy_branch so you can debug. To switch back to main, use: git symbolic-ref HEAD refs/heads/main && git reset --mixed >&2
       return $diff
       ;;
   esac
 }
 
-initial_deploy() {
-  echo "initial_deploy..."
-  git fetch origin $deploy_branch
-  git --work-tree "$gh_pages_directory" fetch --force $repo $deploy_branch:$deploy_branch
-  git --work-tree "$gh_pages_directory" checkout $deploy_branch
-  handle_deploy_files
-  git --work-tree "$gh_pages_directory" add --all
-  check_diff
-}
-
-incremental_deploy() {
-  echo "incremental_deploy..."
-  #make deploy_branch the current branch
-  git symbolic-ref HEAD refs/heads/$deploy_branch
-  #put the previously committed contents of deploy_branch into the index
-  git --work-tree "$gh_pages_directory" reset --mixed --quiet
-  handle_deploy_files
-  git --work-tree "$gh_pages_directory" add --all
-  check_diff
-}
-
 commit+push() {
   set_user_id
-  git --work-tree "$gh_pages_directory" commit -m "$commit_message"
+  git --work-tree "$deploy_directory" commit -m "$commit_message"
 
   disable_expanded_output
   #--quiet is important here to avoid outputting the repo URL, which may contain a secret token
-  if [ $GH_TOKEN ]; then
-    # deploy by Travis CI
-    # add github token
-    # repo="https://"$GH_TOKEN"@github.com/huobiapi/docs.git"
-    repo = "git@github.com:YXQ212526/plagiarism.git"
-    git remote add origin-pages $repo
-    git push --quiet origin-pages $deploy_branch
-  else
-    # manual deploy
-    git push --quiet $repo $deploy_branch
-  fi
+  git push --quiet $repo $deploy_branch
   enable_expanded_output
 }
 
@@ -285,31 +216,11 @@ sanitize() {
 
 parse_args "$@"
 
-if [[ -n "$source_only" ]]; then
-  echo "source only"
+if [[ ${source_only} ]]; then
   run_build
-elif [[ -n "$push_only" ]]; then
-  echo "push only"
-  main
+elif [[ ${push_only} ]]; then
+  main "$@"
 else
-  echo "source and push"
   run_build
-  main
+  main "$@"
 fi
-
-var ghpages = require('gh-pages')
-var REPO = 'git@github.com:YXQ212526/plagiarism.git'
-
-function callback(e) {
-  if (e) {
-    console.err(e)
-    return
-  }
-  console.log('deploy succeed !')
-}
-
-ghpages.publish('build', {
-  repo: REPO,
-}, callback)
-
-
